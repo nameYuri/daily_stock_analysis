@@ -12,11 +12,12 @@ Covers:
 """
 
 import json
+import time
 import unittest
 import sys
 import os
 from dataclasses import dataclass
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -28,7 +29,7 @@ except ModuleNotFoundError:
 
 from src.agent.executor import AgentExecutor, AgentResult
 from src.agent.llm_adapter import LLMResponse, ToolCall
-from src.agent.runner import parse_dashboard_json, serialize_tool_result
+from src.agent.runner import parse_dashboard_json, run_agent_loop, serialize_tool_result
 from src.agent.tools.registry import ToolRegistry, ToolDefinition, ToolParameter
 
 
@@ -258,7 +259,68 @@ class TestAgentExecutor(unittest.TestCase):
         result = executor.run("Test unknown tool")
 
         self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 1)
         self.assertFalse(result.tool_calls_log[0]["success"])
+        self.assertFalse(result.tool_calls_log[0]["cached"])
+
+    def test_non_retriable_tool_failure_is_cached_across_hk_variants(self):
+        """Equivalent HK code variants should not re-execute a non-retriable failing tool."""
+        calls = []
+
+        def _quote(stock_code):
+            calls.append(stock_code)
+            return {
+                "error": f"No realtime quote available for {stock_code}",
+                "retriable": False,
+                "note": "Skip retry",
+            }
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_realtime_quote",
+                description="Get realtime quote",
+                parameters=[
+                    ToolParameter(name="stock_code", type="string", description="Stock code"),
+                ],
+                handler=_quote,
+            )
+        )
+        adapter = _make_mock_adapter()
+
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id="q1", name="get_realtime_quote", arguments={"stock_code": "hk01810"}),
+                ],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(id="q2", name="get_realtime_quote", arguments={"stock_code": "1810.HK"}),
+                ],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        executor = AgentExecutor(registry, adapter, max_steps=5)
+        result = executor.run("Analyze HK01810")
+
+        self.assertTrue(result.success)
+        self.assertEqual(calls, ["hk01810"])
+        self.assertEqual(len(result.tool_calls_log), 2)
+        self.assertFalse(result.tool_calls_log[0]["cached"])
+        self.assertTrue(result.tool_calls_log[1]["cached"])
 
     def test_model_trace_deduplicates_and_keeps_order(self):
         """Model trace should keep call order and de-duplicate repeated models."""
@@ -311,6 +373,158 @@ class TestAgentExecutor(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertEqual(result.model, "")
+
+    def test_timeout_budget_aborts_single_agent_loop(self):
+        """Single-agent executor should stop once the configured timeout budget is exhausted."""
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+
+        def _slow_llm(*_args, **_kwargs):
+            time.sleep(0.03)
+            return LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            )
+
+        adapter.call_with_tools.side_effect = _slow_llm
+
+        executor = AgentExecutor(registry, adapter, max_steps=2, timeout_seconds=0.01)
+        result = executor.run("Analyze 600519")
+
+        self.assertFalse(result.success)
+        self.assertIn("timed out", (result.error or "").lower())
+
+    def test_parallel_tool_timeout_marks_only_pending_calls(self):
+        """Parallel tool batches should emit timeout errors for unfinished tools."""
+        registry = ToolRegistry()
+
+        def _maybe_slow_echo(message):
+            if message == "slow":
+                time.sleep(0.05)
+            return {"echo": message}
+
+        registry.register(
+            ToolDefinition(
+                name="echo",
+                description="Echoes back the input",
+                parameters=[
+                    ToolParameter(name="message", type="string", description="Message to echo"),
+                ],
+                handler=_maybe_slow_echo,
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="Gathering data.",
+                tool_calls=[
+                    ToolCall(id="fast", name="echo", arguments={"message": "fast"}),
+                    ToolCall(id="slow", name="echo", arguments={"message": "slow"}),
+                ],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        result = run_agent_loop(
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "Analyze"},
+            ],
+            tool_registry=registry,
+            llm_adapter=adapter,
+            max_steps=3,
+            tool_call_timeout_seconds=0.01,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 2)
+        timeout_logs = [log for log in result.tool_calls_log if log.get("timeout")]
+        self.assertEqual(len(timeout_logs), 1)
+        self.assertEqual(timeout_logs[0]["arguments"]["message"], "slow")
+
+    def test_single_tool_timeout_marks_tool_failed(self):
+        """Single tool calls should also respect the configured tool timeout."""
+        registry = ToolRegistry()
+
+        def _slow_echo(message):
+            time.sleep(0.05)
+            return {"echo": message}
+
+        registry.register(
+            ToolDefinition(
+                name="echo",
+                description="Echoes back the input",
+                parameters=[
+                    ToolParameter(name="message", type="string", description="Message to echo"),
+                ],
+                handler=_slow_echo,
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="Gathering data.",
+                tool_calls=[ToolCall(id="slow", name="echo", arguments={"message": "slow"})],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        result = run_agent_loop(
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "Analyze"},
+            ],
+            tool_registry=registry,
+            llm_adapter=adapter,
+            max_steps=3,
+            tool_call_timeout_seconds=0.01,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.tool_calls_log), 1)
+        self.assertTrue(result.tool_calls_log[0].get("timeout"))
+        self.assertEqual(result.tool_calls_log[0]["arguments"]["message"], "slow")
+
+    def test_llm_call_receives_remaining_timeout_budget(self):
+        """LLM tool calls should receive the remaining wall-clock budget."""
+        registry = _make_registry_with_echo()
+        adapter = _make_mock_adapter()
+        captured = {}
+
+        def _capture_timeout(*_args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            )
+
+        adapter.call_with_tools.side_effect = _capture_timeout
+
+        executor = AgentExecutor(registry, adapter, max_steps=2, timeout_seconds=0.2)
+        result = executor.run("Analyze 600519")
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(captured.get("timeout"))
+        self.assertGreater(captured["timeout"], 0.0)
+        self.assertLessEqual(captured["timeout"], 0.2)
 
 
 # ============================================================

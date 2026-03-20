@@ -43,6 +43,12 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         os.environ.pop("ENV_FILE", None)
         self.temp_dir.cleanup()
 
+    def _rewrite_env(self, *lines: str) -> None:
+        self.env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        Config.reset_instance()
+        self.manager = ConfigManager(env_path=self.env_path)
+        self.service = SystemConfigService(manager=self.manager)
+
     def test_get_config_returns_raw_sensitive_values(self) -> None:
         payload = self.service.get_config(include_schema=True)
         items = {item["key"]: item for item in payload["items"]}
@@ -83,6 +89,25 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["code"] == "invalid_url" for issue in validation["issues"]))
 
+    def test_validate_reports_invalid_public_searxng_toggle(self) -> None:
+        validation = self.service.validate(
+            items=[{"key": "SEARXNG_PUBLIC_INSTANCES_ENABLED", "value": "maybe"}]
+        )
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(issue["code"] == "invalid_type" for issue in validation["issues"]))
+
+    def test_update_persists_public_searxng_toggle(self) -> None:
+        old_version = self.manager.get_config_version()
+        response = self.service.update(
+            config_version=old_version,
+            items=[{"key": "SEARXNG_PUBLIC_INSTANCES_ENABLED", "value": "false"}],
+            reload_now=False,
+        )
+
+        self.assertTrue(response["success"])
+        current_map = self.manager.read_config_map()
+        self.assertEqual(current_map["SEARXNG_PUBLIC_INSTANCES_ENABLED"], "false")
+
     def test_validate_reports_invalid_llm_channel_definition(self) -> None:
         validation = self.service.validate(
             items=[
@@ -109,6 +134,55 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["key"] == "LITELLM_MODEL" and issue["code"] == "unknown_model" for issue in validation["issues"]))
+
+    def test_validate_reports_unknown_agent_primary_model_for_channels(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+                {"key": "AGENT_LITELLM_MODEL", "value": "openai/gpt-4o"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(issue["key"] == "AGENT_LITELLM_MODEL" and issue["code"] == "unknown_model" for issue in validation["issues"]))
+
+    def test_validate_accepts_unprefixed_agent_model_when_channel_declares_openai_model(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+                {"key": "AGENT_LITELLM_MODEL", "value": "gpt-4o-mini"},
+            ]
+        )
+
+        self.assertTrue(validation["valid"])
+        self.assertEqual(validation["issues"], [])
+
+    @patch.object(
+        Config,
+        "_parse_litellm_yaml",
+        return_value=[
+            {
+                "model_name": "gpt4o",
+                "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "sk-test-value"},
+            }
+        ],
+    )
+    def test_validate_accepts_unprefixed_agent_model_when_yaml_declares_alias(self, _mock_parse_yaml) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LITELLM_CONFIG", "value": "/tmp/litellm.yaml"},
+                {"key": "AGENT_LITELLM_MODEL", "value": "gpt4o"},
+            ]
+        )
+
+        self.assertTrue(validation["valid"])
+        self.assertEqual(validation["issues"], [])
 
     @patch.object(
         Config,
@@ -138,11 +212,71 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertEqual(agent_arch_schema["options"][1]["label"], "Multi Agent (Orchestrator)")
         self.assertEqual(agent_arch_schema["validation"]["enum"], ["single", "multi"])
 
+        report_language_schema = items["REPORT_LANGUAGE"]["schema"]
+        self.assertEqual(report_language_schema["validation"]["enum"], ["zh", "en"])
+        self.assertEqual(report_language_schema["options"][1]["value"], "en")
+
+        self.assertEqual(items["AGENT_ORCHESTRATOR_TIMEOUT_S"]["schema"]["default_value"], "600")
+        self.assertFalse(items["AGENT_DEEP_RESEARCH_BUDGET"]["schema"]["is_editable"])
+        self.assertFalse(items["AGENT_EVENT_MONITOR_ENABLED"]["schema"]["is_editable"])
+
     def test_validate_reports_invalid_select_option(self) -> None:
         validation = self.service.validate(items=[{"key": "AGENT_ARCH", "value": "invalid-mode"}])
 
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["code"] == "invalid_enum" for issue in validation["issues"]))
+
+    def test_validate_accepts_report_language_english(self) -> None:
+        validation = self.service.validate(items=[{"key": "REPORT_LANGUAGE", "value": "en"}])
+
+        self.assertTrue(validation["valid"])
+        self.assertEqual(validation["issues"], [])
+
+    def test_validate_accepts_legacy_agent_orchestrator_mode_alias(self) -> None:
+        validation = self.service.validate(items=[{"key": "AGENT_ORCHESTRATOR_MODE", "value": "strategy"}])
+
+        self.assertTrue(validation["valid"])
+        self.assertEqual(validation["issues"], [])
+
+    def test_get_config_projects_legacy_strategy_aliases_onto_skill_fields(self) -> None:
+        self._rewrite_env(
+            "AGENT_STRATEGY_DIR=legacy-strategies",
+            "AGENT_STRATEGY_AUTOWEIGHT=false",
+            "AGENT_STRATEGY_ROUTING=manual",
+        )
+
+        payload = self.service.get_config(include_schema=True)
+        items = {item["key"]: item for item in payload["items"]}
+
+        self.assertEqual(items["AGENT_SKILL_DIR"]["value"], "legacy-strategies")
+        self.assertEqual(items["AGENT_SKILL_AUTOWEIGHT"]["value"], "false")
+        self.assertEqual(items["AGENT_SKILL_ROUTING"]["value"], "manual")
+        self.assertNotIn("AGENT_STRATEGY_DIR", items)
+        self.assertNotIn("AGENT_STRATEGY_AUTOWEIGHT", items)
+        self.assertNotIn("AGENT_STRATEGY_ROUTING", items)
+
+    def test_get_config_respects_empty_canonical_skill_field_over_legacy_alias(self) -> None:
+        self._rewrite_env(
+            "AGENT_SKILL_DIR=",
+            "AGENT_STRATEGY_DIR=legacy-strategies",
+        )
+
+        payload = self.service.get_config(include_schema=True)
+        items = {item["key"]: item for item in payload["items"]}
+
+        self.assertEqual(items["AGENT_SKILL_DIR"]["value"], "")
+
+    def test_get_config_normalizes_legacy_orchestrator_mode_for_ui(self) -> None:
+        self._rewrite_env("AGENT_ORCHESTRATOR_MODE=strategy")
+
+        payload = self.service.get_config(include_schema=True)
+        items = {item["key"]: item for item in payload["items"]}
+
+        self.assertEqual(items["AGENT_ORCHESTRATOR_MODE"]["value"], "specialist")
+        self.assertEqual(
+            items["AGENT_ORCHESTRATOR_MODE"]["schema"]["validation"]["enum"],
+            ["quick", "standard", "full", "specialist", "strategy", "skill"],
+        )
 
     @patch.object(
         Config,
@@ -190,6 +324,21 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["key"] == "LITELLM_MODEL" and issue["code"] == "missing_runtime_source" for issue in validation["issues"]))
 
+    def test_validate_reports_stale_agent_primary_model_when_all_channels_disabled(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+                {"key": "LLM_PRIMARY_ENABLED", "value": "false"},
+                {"key": "AGENT_LITELLM_MODEL", "value": "openai/gpt-4o-mini"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(issue["key"] == "AGENT_LITELLM_MODEL" and issue["code"] == "missing_runtime_source" for issue in validation["issues"]))
+
     def test_validate_allows_primary_model_when_all_channels_disabled_but_legacy_key_exists(self) -> None:
         validation = self.service.validate(
             items=[
@@ -228,8 +377,11 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertEqual(payload["resolved_protocol"], "openai")
         self.assertEqual(payload["resolved_model"], "openai/deepseek-chat")
 
-    @patch("src.search_service.reset_search_service")
-    def test_update_with_reload_resets_search_service_singleton(self, mock_reset_search_service) -> None:
+    @patch.object(SystemConfigService, "_reload_runtime_singletons")
+    def test_update_with_reload_resets_runtime_singletons(
+        self,
+        mock_reload_runtime_singletons,
+    ) -> None:
         response = self.service.update(
             config_version=self.manager.get_config_version(),
             items=[{"key": "STOCK_LIST", "value": "600519"}],
@@ -237,7 +389,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         )
 
         self.assertTrue(response["success"])
-        mock_reset_search_service.assert_called_once()
+        mock_reload_runtime_singletons.assert_called_once()
 
     def test_update_raises_conflict_for_stale_version(self) -> None:
         with self.assertRaises(ConfigConflictError):
@@ -246,6 +398,33 @@ class SystemConfigServiceTestCase(unittest.TestCase):
                 items=[{"key": "STOCK_LIST", "value": "600519"}],
                 reload_now=False,
             )
+
+    def test_update_appends_news_window_explainability_warning(self) -> None:
+        response = self.service.update(
+            config_version=self.manager.get_config_version(),
+            items=[
+                {"key": "NEWS_STRATEGY_PROFILE", "value": "ultra_short"},
+                {"key": "NEWS_MAX_AGE_DAYS", "value": "7"},
+            ],
+            reload_now=False,
+        )
+
+        self.assertTrue(response["success"])
+        joined = " | ".join(response["warnings"])
+        self.assertIn("effective_days=1", joined)
+        self.assertIn("min(profile_days, NEWS_MAX_AGE_DAYS)", joined)
+
+    def test_update_appends_max_workers_warning(self) -> None:
+        response = self.service.update(
+            config_version=self.manager.get_config_version(),
+            items=[{"key": "MAX_WORKERS", "value": "1"}],
+            reload_now=False,
+        )
+
+        self.assertTrue(response["success"])
+        joined = " | ".join(response["warnings"])
+        self.assertIn("MAX_WORKERS=1", joined)
+        self.assertIn("reload_now=false", joined)
 
 
     def test_validate_rejects_comma_only_api_key(self) -> None:
